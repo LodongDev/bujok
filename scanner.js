@@ -41,7 +41,21 @@ async function fetchMapChunk(ox, oy) {
 // ============================================
 async function scanVillages() {
     const { myX, myY, searchRadius } = CONFIG;
-    const chunks = getChunkOrigins(myX, myY, searchRadius);
+
+    // 멀티 마을: 모든 마을을 포함하는 확장 스캔 영역
+    let scanCenterX = myX, scanCenterY = myY, scanRadius = searchRadius;
+    if (CONFIG.villages && CONFIG.villages.length > 1) {
+        const xs = CONFIG.villages.map(v => v.x);
+        const ys = CONFIG.villages.map(v => v.y);
+        scanCenterX = Math.round((Math.min(...xs) + Math.max(...xs)) / 2);
+        scanCenterY = Math.round((Math.min(...ys) + Math.max(...ys)) / 2);
+        // 마을 간 최대 거리의 절반 + 기본 반경
+        const spread = Math.max(Math.max(...xs) - Math.min(...xs), Math.max(...ys) - Math.min(...ys));
+        scanRadius = searchRadius + Math.ceil(spread / 2);
+        console.log(`[스캔] 멀티 마을 확장 스캔: 중심 (${scanCenterX},${scanCenterY}), 반경 ${scanRadius}칸`);
+    }
+
+    const chunks = getChunkOrigins(scanCenterX, scanCenterY, scanRadius);
     console.log(`[스캔] 맵 청크 ${chunks.length}개 요청 중...`);
 
     const allVillages = [];
@@ -66,7 +80,15 @@ async function scanVillages() {
                     const v = rowData[col];
                     const vx = ox + row;
                     const vy = oy + parseInt(col);
-                    const dist = distance(myX, myY, vx, vy);
+                    // 아무 마을에서든 반경 안이면 포함
+                    let minDist = distance(myX, myY, vx, vy);
+                    if (CONFIG.villages && CONFIG.villages.length > 1) {
+                        for (const mv of CONFIG.villages) {
+                            const d = distance(mv.x, mv.y, vx, vy);
+                            if (d < minDist) minDist = d;
+                        }
+                    }
+                    const dist = minDist;
 
                     if (dist <= searchRadius) {
                         const villageId = v[0];

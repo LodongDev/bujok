@@ -6,12 +6,33 @@ const reporter = require('./reporter');
 const { renewCookie } = require('./cookie-renew');
 
 const COOKIE_FILE = path.join(__dirname, 'cookie.txt');
+
+// 사람처럼 랜덤 딜레이 (min~max ms, 가끔 긴 휴식)
+function humanDelay(minMs = 2000, maxMs = 5000) {
+    // 10% 확률로 긴 휴식 (사람이 다른 거 보다가 돌아온 느낌)
+    if (Math.random() < 0.10) {
+        const long = 8000 + Math.random() * 15000; // 8~23초
+        return sleep(long);
+    }
+    const base = minMs + Math.random() * (maxMs - minMs);
+    const jitter = base * (0.8 + Math.random() * 0.4);
+    return sleep(Math.round(jitter));
+}
 const WHITELIST_FILE = path.join(__dirname, 'whitelist.json');
+const BLACKLIST_FILE = path.join(__dirname, 'blacklist.json');
 
 // whitelist.json에서 허용 좌표 목록 실시간 로드 ("XXX|YYY" 형식)
 function getWhitelist() {
     try {
         const list = JSON.parse(fs.readFileSync(WHITELIST_FILE, 'utf-8'));
+        return new Set(list.map(s => s.trim()));
+    } catch { return new Set(); }
+}
+
+// blacklist.json에서 공격 금지 좌표 목록 실시간 로드 ("XXX|YYY" 형식)
+function getBlacklist() {
+    try {
+        const list = JSON.parse(fs.readFileSync(BLACKLIST_FILE, 'utf-8'));
         return new Set(list.map(s => s.trim()));
     } catch { return new Set(); }
 }
@@ -501,7 +522,7 @@ async function recruitTroops(csrf, resources, pop, phase) {
             log(`  생산 에러: ${unit} -> ${err.message}`);
         }
 
-        await sleep(500);
+        await humanDelay(800, 2000);
     }
 
     return { recruited, totalRecruited };
@@ -552,9 +573,11 @@ function createAttackPlan(available, targets, phase, outgoingTargets) {
     // 야만인 마을 + 화이트리스트 유저 마을 | 이동시간 범위 | 출정 중 아닌 | 보호 아닌 | 자원 충분
     const now = new Date().toISOString();
     const whitelist = getWhitelist();
+    const blacklist = getBlacklist();
     let lowResSkipped = 0;
     const eligible = targets.filter(t => {
         const coordKey = `${t.x}|${t.y}`;
+        if (blacklist.has(coordKey)) return false;
         const isWhitelisted = whitelist.has(coordKey);
         if (!isWhitelisted && t.playerId && t.playerId !== '0' && t.playerId !== 0) return false;
         if (t.distance * speed > cfg.maxDistMin) return false;
@@ -674,31 +697,37 @@ async function sendAttack(targetX, targetY, troops, csrf, ch) {
 // 실시간 적응형 파밍 — 매 공격마다 병력 재조회 + 배분
 // ============================================
 async function farmAdaptive(targets, phase, outgoingTargets, db, dirOptions = {}) {
-    const { farmDir, villageX, villageY, dirBoundaryY } = dirOptions;
+    const { villageX, villageY, farmYmin, farmYmax } = dirOptions;
     const cfg = PHASE_CONFIG[phase];
     const speed = phase === 'early' ? UNIT_SPEED.spear : UNIT_SPEED.light;
     const whitelist = getWhitelist();
+    const blacklist = getBlacklist();
     const attackedThisCycle = new Set();
     let totalAttacks = 0;
     let lastTroops = null;
+
+    // 최초 1회만 병력 조회, 이후 보낸 만큼 차감 (요청 수 절반 감소)
+    let pool = null;
+    let state = null;
 
     while (true) {
         // 1. 타겟 선정 (매 루프 재필터 — 이번 사이클 공격한 곳 제외)
         const now = new Date().toISOString();
         const eligible = targets.filter(t => {
             if (attackedThisCycle.has(t.id)) return false;
+            // 자기 자신 제외
+            if (t.x === villageX && t.y === villageY) return false;
             const coordKey = `${t.x}|${t.y}`;
+            if (blacklist.has(coordKey)) return false;
             const isWhitelisted = whitelist.has(coordKey);
             if (!isWhitelisted && t.playerId && t.playerId !== '0' && t.playerId !== 0) return false;
-            // 방향 필터 (north: 경계선 이북, south: 경계선 이남)
-            if (farmDir === 'north' && dirBoundaryY !== null && dirBoundaryY !== undefined && t.y > dirBoundaryY) return false;
-            if (farmDir === 'south' && dirBoundaryY !== null && dirBoundaryY !== undefined && t.y <= dirBoundaryY) return false;
-            // 이 마을로부터의 거리 계산
+            // y축 영역 필터
+            if (farmYmin !== undefined && t.y < farmYmin) return false;
+            if (farmYmax !== undefined && t.y > farmYmax) return false;
             const dist = villageX !== undefined ? distance(t.x, t.y, villageX, villageY) : t.distance;
             if (dist * speed > cfg.maxDistMin) return false;
             if (outgoingTargets && outgoingTargets.has(t.id)) return false;
             if (t.protectedUntil && t.protectedUntil > now) return false;
-            // 가까운 마을은 자원 적어도 보냄 (놀리는 것보다 나음)
             const estRes = estimateResources(t);
             const minRes = dist <= 3 ? 20 : 50;
             if (estRes < minRes) return false;
@@ -717,17 +746,17 @@ async function farmAdaptive(targets, phase, outgoingTargets, db, dirOptions = {}
 
         const farm = eligible[0];
 
-        // 2. 실시간 병력 + 토큰 조회 (타겟별 개별 조회)
-        let state;
-        try {
-            state = await getGameState(farm.id);
-        } catch (err) {
-            log(`  상태 조회 실패: ${err.message}`);
-            break;
+        // 2. 병력 + 토큰 조회 (첫 공격 또는 10회마다 갱신)
+        if (!pool || totalAttacks % 10 === 0) {
+            try {
+                state = await getGameState(farm.id);
+                pool = { ...state.troops };
+                lastTroops = { ...pool };
+            } catch (err) {
+                log(`  상태 조회 실패: ${err.message}`);
+                break;
+            }
         }
-
-        const pool = state.troops;
-        lastTroops = { ...pool };
 
         // 3. 병력 체크 — LC 최소 3 미만이면 종료
         if ((pool.light || 0) < 3) {
@@ -735,7 +764,7 @@ async function farmAdaptive(targets, phase, outgoingTargets, db, dirOptions = {}
             break;
         }
 
-        // 4. 실시간 병력 기반 배분
+        // 4. 병력 기반 배분
         const alloc = calculateAllocation(pool, farm, phase);
         if (!alloc || Object.values(alloc).reduce((s, v) => s + v, 0) === 0) {
             attackedThisCycle.add(farm.id);
@@ -759,9 +788,9 @@ async function farmAdaptive(targets, phase, outgoingTargets, db, dirOptions = {}
 
         // 5. 공격 전송
         try {
-            await sleep(800);
+            await humanDelay(1500, 3000);
             const ch = await postConfirm(farm.x, farm.y, alloc, state.csrf, state.dynamicToken);
-            await sleep(800);
+            await humanDelay(1000, 2500);
             const result = await sendAttack(farm.x, farm.y, alloc, state.csrf, ch);
             const success = !result.error;
 
@@ -770,6 +799,11 @@ async function farmAdaptive(targets, phase, outgoingTargets, db, dirOptions = {}
             const dbFarm = db.farms.find(f => f.id === farm.id);
             if (success) {
                 totalAttacks++;
+                // 보낸 병력 차감 (다음 조회까지 로컬 추적)
+                for (const [u, c] of Object.entries(alloc)) {
+                    pool[u] = Math.max(0, (pool[u] || 0) - c);
+                }
+                lastTroops = { ...pool };
                 if (dbFarm) {
                     dbFarm.lastAttack = new Date().toISOString();
                     dbFarm.history.push({ date: new Date().toISOString(), troops: alloc, carry, success: true });
@@ -793,7 +827,7 @@ async function farmAdaptive(targets, phase, outgoingTargets, db, dirOptions = {}
             }
         }
 
-        await sleep(CONFIG.commandDelayMs);
+        await humanDelay(1500, 4000);
     }
 
     log(`  전송 완료: ${totalAttacks}회`);
@@ -845,16 +879,12 @@ async function autopilot(options = {}) {
     // --- 멀티 마을 초기화 ---
     log('[마을 초기화]');
     let activeVillages = await initVillages();
-    let dirBoundaryY = activeVillages.length >= 2
-        ? Math.floor(activeVillages.reduce((s, v) => s + v.y, 0) / activeVillages.length)
-        : null;
 
     for (const v of activeVillages) {
-        const dirLabel = v.farmDir === 'north' ? '북쪽' : v.farmDir === 'south' ? '남쪽' : '전체';
-        log(`  ${v.name} (${v.x},${v.y}) ID:${v.id} → ${dirLabel} 파밍`);
-    }
-    if (dirBoundaryY !== null) {
-        log(`  방향 경계선: y=${dirBoundaryY} (이하=북, 초과=남)`);
+        const yMin = v.farmYmin !== undefined ? `y≥${v.farmYmin}` : 'y≥0';
+        const yMax = v.farmYmax !== undefined ? `y≤${v.farmYmax}` : '';
+        const range = [yMin, yMax].filter(Boolean).join(', ');
+        log(`  ${v.name} (${v.x},${v.y}) ID:${v.id} → ${range}`);
     }
 
     let cycle = 0;
@@ -941,9 +971,8 @@ async function autopilot(options = {}) {
             CONFIG.myY = village.y;
 
             try {
-                const dirLabel = village.farmDir === 'north' ? '북쪽' : village.farmDir === 'south' ? '남쪽' : '전체';
                 console.log('');
-                log(`--- ${village.name} (${village.x},${village.y}) [${dirLabel}] ---`);
+                log(`--- ${village.name} (${village.x},${village.y}) ---`);
 
                 // --- 1. 상태 조회 ---
                 const state = await getGameState(targets[0].id);
@@ -954,7 +983,7 @@ async function autopilot(options = {}) {
                 log(`  자원: W:${resources.wood} C:${resources.clay} I:${resources.iron}`);
                 log(`  페이즈: ${PHASE_CONFIG[phase].name}`);
 
-                await sleep(500);
+                await humanDelay(1000, 2500);
 
                 // --- 2. 출정 중인 마을 제외 ---
                 let outgoingTargets = new Set();
@@ -978,10 +1007,10 @@ async function autopilot(options = {}) {
                 log('[파밍]');
                 if (!dryRun) {
                     const farmResult = await farmAdaptive(targets, phase, outgoingTargets, db, {
-                        farmDir: village.farmDir,
                         villageX: village.x,
                         villageY: village.y,
-                        dirBoundaryY,
+                        farmYmin: village.farmYmin,
+                        farmYmax: village.farmYmax,
                     });
                     fs.writeFileSync(CONFIG.farmDbFile, JSON.stringify(db, null, 2), 'utf-8');
 

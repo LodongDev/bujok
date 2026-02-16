@@ -1,5 +1,14 @@
 const fs = require('fs');
+const path = require('path');
 const { CONFIG, buildHeaders, sleep } = require('./config');
+
+const BLACKLIST_FILE = path.join(__dirname, 'blacklist.json');
+function getBlacklist() {
+    try {
+        const list = JSON.parse(fs.readFileSync(BLACKLIST_FILE, 'utf-8'));
+        return new Set(list.map(s => s.trim()));
+    } catch { return new Set(); }
+}
 
 // ============================================
 // farmer.js — 스마트 병력 배분 파밍
@@ -122,8 +131,12 @@ function createAttackPlan(available, targets, phase) {
     const pool = { ...available };
     const plan = [];
 
-    // 거리 필터 (이동 시간 기준)
-    const eligible = targets.filter(t => travelTime(t.distance, phase) <= cfg.maxDistMinutes);
+    // 거리 필터 (이동 시간 기준) + 블랙리스트
+    const blacklist = getBlacklist();
+    const eligible = targets.filter(t => {
+        if (blacklist.has(`${t.x}|${t.y}`)) return false;
+        return travelTime(t.distance, phase) <= cfg.maxDistMinutes;
+    });
 
     let skippedByHistory = 0;
 

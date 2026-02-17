@@ -36,5 +36,7 @@ targets.csv
 whitelist.json
 debug_report.html
 .chrome-profile/
+.chrome-link
+.cookies-tmp
 .claude/
 nu_

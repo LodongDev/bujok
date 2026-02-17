@@ -697,7 +697,7 @@ async function sendAttack(targetX, targetY, troops, csrf, ch) {
 // 실시간 적응형 파밍 — 매 공격마다 병력 재조회 + 배분
 // ============================================
 async function farmAdaptive(targets, phase, outgoingTargets, db, dirOptions = {}) {
-    const { villageX, villageY, farmYmin, farmYmax } = dirOptions;
+    const { villageX, villageY, allVillages } = dirOptions;
     const cfg = PHASE_CONFIG[phase];
     const speed = phase === 'early' ? UNIT_SPEED.spear : UNIT_SPEED.light;
     const whitelist = getWhitelist();
@@ -721,11 +721,21 @@ async function farmAdaptive(targets, phase, outgoingTargets, db, dirOptions = {}
             if (blacklist.has(coordKey)) return false;
             const isWhitelisted = whitelist.has(coordKey);
             if (!isWhitelisted && t.playerId && t.playerId !== '0' && t.playerId !== 0) return false;
-            // y축 영역 필터
-            if (farmYmin !== undefined && t.y < farmYmin) return false;
-            if (farmYmax !== undefined && t.y > farmYmax) return false;
+            // 거리 기반 영역 — 이 타겟에 대해 내가 가장 가까운 마을일 때만 파밍
             const dist = villageX !== undefined ? distance(t.x, t.y, villageX, villageY) : t.distance;
+            if (allVillages && allVillages.length > 1) {
+                const myDist = dist;
+                const closer = allVillages.some(v => v.x !== villageX || v.y !== villageY
+                    ? distance(t.x, t.y, v.x, v.y) < myDist : false);
+                if (closer) return false;
+            }
             if (dist * speed > cfg.maxDistMin) return false;
+            // 결집 데드라인 — 남은 시간 내 왕복 가능한 거리만
+            if (CONFIG.rallyDeadline) {
+                const remainingMin = (CONFIG.rallyDeadline - Date.now()) / 60000;
+                const roundTripMin = dist * speed * 2;
+                if (roundTripMin > remainingMin) return false;
+            }
             if (outgoingTargets && outgoingTargets.has(t.id)) return false;
             if (t.protectedUntil && t.protectedUntil > now) return false;
             const estRes = estimateResources(t);
@@ -940,6 +950,19 @@ async function autopilot(options = {}) {
         console.log('');
         log(`======= 사이클 #${cycle} =======`);
 
+        // 결집 데드라인 표시
+        if (CONFIG.rallyDeadline) {
+            const remainingMin = (CONFIG.rallyDeadline - Date.now()) / 60000;
+            if (remainingMin <= 0) {
+                log('[결집] 데드라인 경과 → 파밍 중단');
+                break;
+            }
+            const remainingH = (remainingMin / 60).toFixed(1);
+            const maxDist = Math.floor(remainingMin / (10 * 2)); // LC 기준
+            const deadlineStr = new Date(CONFIG.rallyDeadline).toLocaleTimeString('ko-KR', { hour12: false });
+            log(`[결집] 남은 ${remainingH}시간 (${deadlineStr}까지) — 편도 ${maxDist}칸 이내`);
+        }
+
         // --- 세션 keep-alive ---
         const sessionOk = await keepAlive();
         if (!sessionOk) {
@@ -1009,8 +1032,7 @@ async function autopilot(options = {}) {
                     const farmResult = await farmAdaptive(targets, phase, outgoingTargets, db, {
                         villageX: village.x,
                         villageY: village.y,
-                        farmYmin: village.farmYmin,
-                        farmYmax: village.farmYmax,
+                        allVillages: activeVillages,
                     });
                     fs.writeFileSync(CONFIG.farmDbFile, JSON.stringify(db, null, 2), 'utf-8');
 
@@ -1138,6 +1160,19 @@ async function autopilot(options = {}) {
 
 // CLI
 const dryRun = process.argv.includes('--dry-run');
+
+// --t N 옵션: 지금부터 N시간 후까지 병력 결집 (시간 지날수록 파밍 범위 축소)
+// 예: node autopilot.js --t 10    → 10시간 후 결집 완료
+const tArgIdx = process.argv.indexOf('--t');
+if (tArgIdx !== -1 && process.argv[tArgIdx + 1]) {
+    const hours = parseFloat(process.argv[tArgIdx + 1]);
+    if (hours > 0) {
+        CONFIG.rallyDeadline = Date.now() + hours * 3600000;
+        const deadlineStr = new Date(CONFIG.rallyDeadline).toLocaleTimeString('ko-KR', { hour12: false });
+        const maxDist = Math.floor(hours * 60 / (10 * 2)); // LC 기준 초기 최대
+        console.log(`[결집] ${hours}시간 후 결집 목표 (${deadlineStr}까지) — 초기 편도 ${maxDist}칸`);
+    }
+}
 
 // --village 옵션: 특정 마을만 실행 (이름 또는 ID)
 // 예: node autopilot.js --village 1번마을

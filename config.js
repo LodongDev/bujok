@@ -42,6 +42,9 @@ const CONFIG = {
     // 보호체크 병렬 설정
     protectionConcurrency: 3,    // 동시 워커 수 (낮출수록 사람처럼 보임)
 
+    // 병력 결집 데드라인 — CLI에서 --t N 으로 설정 (null = 제한 없음)
+    rallyDeadline: null,
+
     // 파밍 분류 기준
     tiers: {
         core: { maxDistance: 10, maxPoints: 100 },    // 가까운 야만인
@@ -53,12 +56,12 @@ const CONFIG = {
     inputFile: './targets.json',
     farmDbFile: './farm-db.json',
 
-    // 멀티 마을 설정 (farmYmin~farmYmax로 y축 영역 배분)
+    // 멀티 마을 설정 (거리 기반 — 각 마을이 가장 가까운 타겟부터 파밍)
     // id: null이면 자동 감지
     villages: [
-        { name: '4번마을', id: 27370, x: 650, y: 435, farmYmax: 441 },            // 북쪽 (y ≤ 441)
-        { name: '1번마을', id: 24333, x: 650, y: 447, farmYmin: 442, farmYmax: 448 }, // 중앙 (442 ≤ y ≤ 448)
-        { name: '3번마을', id: 26266, x: 647, y: 450, farmYmin: 449 },            // 남쪽 (y ≥ 449)
+        { name: '4번마을', id: 27370, x: 650, y: 435 },
+        { name: '1번마을', id: 24333, x: 650, y: 447 },
+        { name: '3번마을', id: 26266, x: 647, y: 450 },
     ],
 };
 

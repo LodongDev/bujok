@@ -25,6 +25,19 @@ const CDP_PORT = 9222;
 const CHROME_USER_DATA = path.join(process.env.LOCALAPPDATA || '', 'Google', 'Chrome', 'User Data');
 const TEMP_PROFILE = path.join(os.tmpdir(), 'bujok-chrome-temp');
 
+// 시스템 Chrome 실행 파일 경로 찾기
+function findChromePath() {
+    const candidates = [
+        path.join(process.env['PROGRAMFILES'] || '', 'Google', 'Chrome', 'Application', 'chrome.exe'),
+        path.join(process.env['PROGRAMFILES(X86)'] || '', 'Google', 'Chrome', 'Application', 'chrome.exe'),
+        path.join(process.env.LOCALAPPDATA || '', 'Google', 'Chrome', 'Application', 'chrome.exe'),
+    ];
+    for (const p of candidates) {
+        if (fs.existsSync(p)) return p;
+    }
+    return null;
+}
+
 function log(msg) {
     const ts = new Date().toLocaleTimeString('ko-KR', { hour12: false });
     console.log(`[${ts}] [쿠키 갱신] ${msg}`);
@@ -69,18 +82,7 @@ async function tryConnectCDP() {
 // 방법 2: Chrome 닫혀있으면 디버그 포트로 시작
 // ============================================
 async function tryLaunchWithDebug() {
-    // Chrome 실행 파일 경로 찾기
-    const chromePaths = [
-        path.join(process.env['PROGRAMFILES'] || '', 'Google', 'Chrome', 'Application', 'chrome.exe'),
-        path.join(process.env['PROGRAMFILES(X86)'] || '', 'Google', 'Chrome', 'Application', 'chrome.exe'),
-        path.join(process.env.LOCALAPPDATA || '', 'Google', 'Chrome', 'Application', 'chrome.exe'),
-    ];
-
-    let chromePath = null;
-    for (const p of chromePaths) {
-        if (fs.existsSync(p)) { chromePath = p; break; }
-    }
-
+    const chromePath = findChromePath();
     if (!chromePath) {
         log('Chrome 실행 파일을 찾을 수 없음');
         return null;
@@ -92,7 +94,7 @@ async function tryLaunchWithDebug() {
         const proc = spawn(chromePath, [
             `--remote-debugging-port=${CDP_PORT}`,
             `--user-data-dir=${CHROME_USER_DATA}`,
-            '--profile-directory=Default',
+            '--profile-directory=Profile 2',
             '--restore-last-session',
         ], {
             detached: true,
@@ -121,7 +123,7 @@ async function tryLaunchWithDebug() {
 function copyProfileToTemp() {
     log('프로필 임시 복사 중...');
     try { fs.rmSync(TEMP_PROFILE, { recursive: true, force: true }); } catch {}
-    fs.mkdirSync(path.join(TEMP_PROFILE, 'Default', 'Network'), { recursive: true });
+    fs.mkdirSync(path.join(TEMP_PROFILE, 'Profile 2', 'Network'), { recursive: true });
 
     function robocopy(src, dst, files) {
         try {
@@ -134,10 +136,10 @@ function copyProfileToTemp() {
         }
     }
 
-    const defaultSrc = path.join(CHROME_USER_DATA, 'Default');
-    robocopy(defaultSrc, path.join(TEMP_PROFILE, 'Default'),
+    const profileSrc = path.join(CHROME_USER_DATA, 'Profile 2');
+    robocopy(profileSrc, path.join(TEMP_PROFILE, 'Profile 2'),
         'Cookies "Cookies-journal" Preferences "Secure Preferences" "Login Data" "Login Data-journal"');
-    robocopy(path.join(defaultSrc, 'Network'), path.join(TEMP_PROFILE, 'Default', 'Network'),
+    robocopy(path.join(profileSrc, 'Network'), path.join(TEMP_PROFILE, 'Profile 2', 'Network'),
         'Cookies "Cookies-journal"');
     try {
         fs.copyFileSync(
@@ -151,22 +153,36 @@ function copyProfileToTemp() {
 }
 
 function cleanupTemp() {
+    // 먼저 임시 프로필을 사용하는 chrome 프로세스 종료
+    try {
+        execSync('taskkill /F /FI "COMMANDLINE eq *bujok-chrome-temp*" /T', { stdio: 'ignore' });
+    } catch {}
     try { fs.rmSync(TEMP_PROFILE, { recursive: true, force: true }); } catch {}
 }
 
 async function tryStealthLaunch() {
+    const chromePath = findChromePath();
+    if (!chromePath) {
+        log('Chrome 실행 파일을 찾을 수 없음');
+        return null;
+    }
+
+    // 이전 임시 프로필 정리
+    cleanupTemp();
+
     let browser;
     let usedTempProfile = false;
 
     try {
         browser = await puppeteer.launch({
             headless: false,
+            executablePath: chromePath,
             userDataDir: CHROME_USER_DATA,
             args: [
                 '--no-sandbox',
                 '--disable-setuid-sandbox',
                 '--disable-blink-features=AutomationControlled',
-                '--profile-directory=Default',
+                '--profile-directory=Profile 2',
             ],
             defaultViewport: null,
         });
@@ -177,12 +193,13 @@ async function tryStealthLaunch() {
                 const tempDir = copyProfileToTemp();
                 browser = await puppeteer.launch({
                     headless: false,
+                    executablePath: chromePath,
                     userDataDir: tempDir,
                     args: [
                         '--no-sandbox',
                         '--disable-setuid-sandbox',
                         '--disable-blink-features=AutomationControlled',
-                        '--profile-directory=Default',
+                        '--profile-directory=Profile 2',
                     ],
                     defaultViewport: null,
                 });
